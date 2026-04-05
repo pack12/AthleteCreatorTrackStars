@@ -117,6 +117,7 @@ class AthleteCreatorApp(tk.Tk):
         super().__init__()
         self.title("Athlete Creator")
         self.resizable(False, False)
+        self._editing_idx: int | None = None
         self._build_ui()
         self._refresh_list()
 
@@ -155,35 +156,61 @@ class AthleteCreatorApp(tk.Tk):
         self._slider_row(input_frame, row=3, label="Stamina:",   var=self.stamina_var)
         self._slider_row(input_frame, row=4, label="Technique:", var=self.technique_var)
 
-        # Add button
-        tk.Button(
-            input_frame, text="Add Athlete", command=self._add_athlete,
+        # Add / Cancel buttons
+        btn_row = tk.Frame(input_frame)
+        btn_row.grid(row=5, column=0, columnspan=3, pady=10)
+
+        self._add_btn = tk.Button(
+            btn_row, text="Add Athlete", command=self._add_athlete,
             bg="#2e7d32", fg="black", font=("Helvetica", 11, "bold"), width=16
-        ).grid(row=5, column=0, columnspan=3, pady=10)
+        )
+        self._add_btn.pack(side="left", padx=(0, 6))
+
+        self._cancel_btn = tk.Button(
+            btn_row, text="Cancel Edit", command=self._cancel_edit,
+            bg="#e65100", fg="black", width=12
+        )
+        # Hidden until an athlete is selected for editing
 
         # ── Estimated Times panel ────────────────────────────────────
         times_frame = tk.LabelFrame(self, text="Estimated Times", **pad)
         times_frame.grid(row=0, column=2, sticky="nsew", **pad)
 
-        mono = ("Courier", 11)
-        self._time_labels: dict[str, tk.Label] = {}
+        mono = ("Courier", 10)
+        self._time_labels: dict[str, dict[str, tk.Label]] = {}
 
-        events = [
-            (400.0,  "400m",  "Aggressive"),
-            (800.0,  "800m",  "Even Pace"),
-            (1600.0, "1600m", "Conservative"),
-            (3200.0, "3200m", "Sit & Kick"),
+        _STRATS_DISPLAY = [
+            ("Aggressive",   "aggressive"),
+            ("Even Pace",    "even"),
+            ("Conservative", "conservative"),
+            ("Sit & Kick",   "kick"),
         ]
-        for i, (dist, label, strat_name) in enumerate(events):
-            tk.Label(times_frame, text=f"{label}", font=mono, anchor="w", width=6).grid(
-                row=i, column=0, sticky="w", padx=(8, 2), pady=6
-            )
-            lbl = tk.Label(times_frame, text="–", font=mono, anchor="w", width=10)
-            lbl.grid(row=i, column=1, sticky="w", padx=2, pady=6)
-            tk.Label(times_frame, text=f"({strat_name})", font=("Helvetica", 10), fg="#555555").grid(
-                row=i, column=2, sticky="w", padx=(2, 8), pady=6
-            )
-            self._time_labels[label] = lbl
+        events = [
+            (400.0,  "400m"),
+            (800.0,  "800m"),
+            (1600.0, "1600m"),
+            (3200.0, "3200m"),
+        ]
+        grid_row = 0
+        for event_idx, (dist, label) in enumerate(events):
+            # Event header
+            tk.Label(
+                times_frame, text=label,
+                font=("Helvetica", 11, "bold"), anchor="w"
+            ).grid(row=grid_row, column=0, columnspan=2, sticky="w",
+                   padx=(8, 8), pady=(10 if event_idx == 0 else 6, 0))
+            grid_row += 1
+
+            self._time_labels[label] = {}
+            for strat_name, strat_key in _STRATS_DISPLAY:
+                tk.Label(
+                    times_frame, text=f"  {strat_name}",
+                    font=("Helvetica", 10), anchor="w", width=14
+                ).grid(row=grid_row, column=0, sticky="w", padx=(8, 2), pady=1)
+                lbl = tk.Label(times_frame, text="–", font=mono, anchor="w", width=9)
+                lbl.grid(row=grid_row, column=1, sticky="w", padx=(2, 8), pady=1)
+                self._time_labels[label][strat_name] = lbl
+                grid_row += 1
 
         # Wire traces — update whenever sliders or gender change
         for var in (self.speed_var, self.stamina_var, self.technique_var):
@@ -208,6 +235,7 @@ class AthleteCreatorApp(tk.Tk):
         scrollbar.config(command=self.listbox.yview)
         self.listbox.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        self.listbox.bind("<<ListboxSelect>>", self._on_athlete_select)
 
         # Action buttons
         btn_frame = tk.Frame(roster_frame)
@@ -232,15 +260,30 @@ class AthleteCreatorApp(tk.Tk):
         except tk.TclError:
             return
 
-        events = [
-            (400.0,  "400m",  "aggressive"),
-            (800.0,  "800m",  "even"),
-            (1600.0, "1600m", "conservative"),
-            (3200.0, "3200m", "kick"),
+        _STRATS_DISPLAY = [
+            ("Aggressive",   "aggressive"),
+            ("Even Pace",    "even"),
+            ("Conservative", "conservative"),
+            ("Sit & Kick",   "kick"),
         ]
-        for dist, label, strategy in events:
-            t = simulate_time(spd, sta, tec, gen, dist, strategy)
-            self._time_labels[label].config(text=f"~{format_time(t)}")
+        events = [
+            (400.0,  "400m"),
+            (800.0,  "800m"),
+            (1600.0, "1600m"),
+            (3200.0, "3200m"),
+        ]
+        for dist, label in events:
+            times = {
+                strat_name: simulate_time(spd, sta, tec, gen, dist, strat_key)
+                for strat_name, strat_key in _STRATS_DISPLAY
+            }
+            fastest_name = min(times, key=times.__getitem__)
+            for strat_name, t in times.items():
+                fg = "#2e7d32" if strat_name == fastest_name else "black"
+                self._time_labels[label][strat_name].config(
+                    text=f"~{format_time(t)}",
+                    fg=fg,
+                )
 
     def _slider_row(self, parent: tk.Widget, row: int, label: str, var: tk.DoubleVar):
         tk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=6, pady=4)
@@ -274,6 +317,37 @@ class AthleteCreatorApp(tk.Tk):
     # Actions
     # ------------------------------------------------------------------
 
+    def _on_athlete_select(self, event):
+        sel = self.listbox.curselection()
+        if not sel:
+            return
+        idx = sel[0]
+        athletes = _load_json()
+        if idx >= len(athletes):
+            return
+        a = athletes[idx]
+        self.name_var.set(a.get("name", ""))
+        self.gender_var.set(a.get("gender", "M"))
+        self.speed_var.set(a.get("speed", 0.50))
+        self.stamina_var.set(a.get("stamina", 0.50))
+        self.technique_var.set(a.get("technique", 0.50))
+        self._editing_idx = idx
+        self._add_btn.config(text="Update Athlete")
+        self._cancel_btn.pack(side="left")
+
+    def _reset_form(self):
+        self.name_var.set("")
+        self.gender_var.set("M")
+        self.speed_var.set(0.50)
+        self.stamina_var.set(0.50)
+        self.technique_var.set(0.50)
+        self._editing_idx = None
+        self._add_btn.config(text="Add Athlete")
+        self._cancel_btn.pack_forget()
+
+    def _cancel_edit(self):
+        self._reset_form()
+
     def _add_athlete(self):
         name = self.name_var.get().strip()
         if not name:
@@ -281,19 +355,30 @@ class AthleteCreatorApp(tk.Tk):
             return
 
         athletes = _load_json()
-        color_idx = len(athletes) % 8
 
-        athletes.append({
-            "name":      name,
-            "gender":    self.gender_var.get(),
-            "speed":     round(self.speed_var.get(), 2),
-            "stamina":   round(self.stamina_var.get(), 2),
-            "technique": round(self.technique_var.get(), 2),
-            "color_idx": color_idx,
-        })
+        if self._editing_idx is not None:
+            idx = self._editing_idx
+            if idx < len(athletes):
+                athletes[idx].update({
+                    "name":      name,
+                    "gender":    self.gender_var.get(),
+                    "speed":     round(self.speed_var.get(), 2),
+                    "stamina":   round(self.stamina_var.get(), 2),
+                    "technique": round(self.technique_var.get(), 2),
+                })
+        else:
+            color_idx = len(athletes) % 8
+            athletes.append({
+                "name":      name,
+                "gender":    self.gender_var.get(),
+                "speed":     round(self.speed_var.get(), 2),
+                "stamina":   round(self.stamina_var.get(), 2),
+                "technique": round(self.technique_var.get(), 2),
+                "color_idx": color_idx,
+            })
 
         _save_json(athletes)
-        self.name_var.set("")
+        self._reset_form()
         self._refresh_list()
 
     def _remove_selected(self):
