@@ -96,6 +96,53 @@ def format_time(seconds: float) -> str:
     return f"{minutes}:{secs:04.1f}"
 
 
+STRATEGY_MAP = {
+    'Aggressive':   'aggressive',
+    'Even Pace':    'even',
+    'Conservative': 'conservative',
+    'Sit & Kick':   'kick',
+}
+
+EVENT_MAP = {'400m': 400.0, '800m': 800.0, '1600m': 1600.0, '3200m': 3200.0}
+
+
+def parse_time(s: str) -> float | None:
+    s = s.strip()
+    if ':' in s:
+        parts = s.split(':')
+        if len(parts) != 2:
+            return None
+        try:
+            return int(parts[0]) * 60 + float(parts[1])
+        except Exception:
+            return None
+    else:
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+
+def find_speed_for_time(
+    target_seconds: float,
+    stamina: float,
+    technique: float,
+    gender: str,
+    distance: float,
+    strategy: str,
+) -> tuple[float, float]:
+    lo, hi = 0.0, 1.0
+    for _ in range(30):  # 30 iterations gives precision of 1/2^30
+        mid = (lo + hi) / 2
+        t = simulate_time(mid, stamina, technique, gender, distance, strategy)
+        if t > target_seconds:
+            lo = mid  # too slow, need more speed
+        else:
+            hi = mid  # too fast, need less speed
+    final_t = simulate_time((lo + hi) / 2, stamina, technique, gender, distance, strategy)
+    return (lo + hi) / 2, final_t
+
+
 def _load_json() -> list[dict]:
     if not os.path.exists(ROSTER_FILE):
         return []
@@ -250,6 +297,97 @@ class AthleteCreatorApp(tk.Tk):
             btn_frame, text="Clear All", command=self._clear_all,
             bg="#6a1b9a", fg="black", width=10
         ).pack(side="left")
+
+        # ── Target Time panel ────────────────────────────────────────
+        self._build_target_time_frame()
+
+    def _build_target_time_frame(self):
+        pad = {"padx": 10, "pady": 6}
+        frame = tk.LabelFrame(self, text="Target Time", **pad)
+        frame.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
+
+        # Row 0: event, strategy, time entry, button
+        tk.Label(frame, text="Event:").grid(row=0, column=0, sticky="w", padx=(8, 2), pady=6)
+        self._tt_event_var = tk.StringVar(value="800m")
+        ttk.Combobox(
+            frame, textvariable=self._tt_event_var,
+            values=["400m", "800m", "1600m", "3200m"],
+            state="readonly", width=7
+        ).grid(row=0, column=1, padx=(2, 12), pady=6)
+
+        tk.Label(frame, text="Strategy:").grid(row=0, column=2, sticky="w", padx=(0, 2), pady=6)
+        self._tt_strategy_var = tk.StringVar(value="Even Pace")
+        ttk.Combobox(
+            frame, textvariable=self._tt_strategy_var,
+            values=["Aggressive", "Even Pace", "Conservative", "Sit & Kick"],
+            state="readonly", width=13
+        ).grid(row=0, column=3, padx=(2, 12), pady=6)
+
+        tk.Label(frame, text="Target Time:").grid(row=0, column=4, sticky="w", padx=(0, 2), pady=6)
+        self._tt_entry_var = tk.StringVar()
+        tk.Entry(frame, textvariable=self._tt_entry_var, width=10).grid(
+            row=0, column=5, padx=(2, 8), pady=6
+        )
+
+        tk.Button(
+            frame, text="Find Speed", command=self._on_find_speed,
+            bg="#1565c0", fg="black", font=("Helvetica", 10, "bold"), width=12
+        ).grid(row=0, column=6, padx=(0, 8), pady=6)
+
+        # Row 1: result label
+        self._tt_result_lbl = tk.Label(frame, text="", anchor="w")
+        self._tt_result_lbl.grid(row=1, column=0, columnspan=7, sticky="ew", padx=8, pady=(0, 6))
+
+    def _on_find_speed(self):
+        target_str = self._tt_entry_var.get()
+        target_seconds = parse_time(target_str)
+        if target_seconds is None:
+            messagebox.showwarning(
+                "Target Time", "Enter a valid time (e.g. 1:57, 1:57.4, 117.4)."
+            )
+            return
+
+        distance = EVENT_MAP[self._tt_event_var.get()]
+        strategy_key = STRATEGY_MAP[self._tt_strategy_var.get()]
+
+        try:
+            sta = self.stamina_var.get()
+            tec = self.technique_var.get()
+            gen = self.gender_var.get()
+        except tk.TclError:
+            return
+
+        fastest = simulate_time(1.0, sta, tec, gen, distance, strategy_key)
+        slowest = simulate_time(0.0, sta, tec, gen, distance, strategy_key)
+
+        if target_seconds < fastest - 0.5 or target_seconds > slowest + 0.5:
+            msg = (
+                f"Not achievable. "
+                f"Fastest possible: {format_time(fastest)} / Slowest: {format_time(slowest)}"
+            )
+            self._tt_result_lbl.config(text=msg, fg="red")
+            messagebox.showwarning(
+                "Not Achievable",
+                f"Target time is outside the achievable range for this athlete's "
+                f"current stamina, technique, and gender.\n\n"
+                f"Fastest possible: {format_time(fastest)}\n"
+                f"Slowest: {format_time(slowest)}"
+            )
+            return
+
+        speed, sim_time = find_speed_for_time(target_seconds, sta, tec, gen, distance, strategy_key)
+
+        if abs(sim_time - target_seconds) > 0.5:
+            msg = (
+                f"Not achievable. "
+                f"Fastest possible: {format_time(fastest)} / Slowest: {format_time(slowest)}"
+            )
+            self._tt_result_lbl.config(text=msg, fg="red")
+            return
+
+        self.speed_var.set(round(speed, 3))
+        msg = f"Speed set to {speed:.3f} — simulated time: {format_time(sim_time)}"
+        self._tt_result_lbl.config(text=msg, fg="#2e7d32")
 
     def _update_estimated_times(self):
         try:
