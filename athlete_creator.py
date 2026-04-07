@@ -105,6 +105,26 @@ STRATEGY_MAP = {
 
 EVENT_MAP = {'400m': 400.0, '800m': 800.0, '1600m': 1600.0, '3200m': 3200.0}
 
+# Build profiles: (display_name, stamina, technique) — None means use current slider value
+PROFILES = [
+    ('Balanced',       0.60, 0.60),
+    ('Pure Speed',     0.40, 0.50),
+    ('High Stamina',   0.85, 0.60),
+    ('High Technique', 0.60, 0.90),
+    ('Elite',          0.85, 0.85),
+    ('Current Stats',  None, None),
+]
+
+
+# 2D solver profiles: vary technique; stamina is solved, not preset
+PROFILES_2D = [
+    ('Low Technique',   0.40),
+    ('Mid Technique',   0.60),
+    ('High Technique',  0.80),
+    ('Elite Technique', 0.95),
+    ('Current Tech',    None),  # use current technique slider
+]
+
 
 def parse_time(s: str) -> float | None:
     s = s.strip()
@@ -141,6 +161,95 @@ def find_speed_for_time(
             hi = mid  # too fast, need less speed
     final_t = simulate_time((lo + hi) / 2, stamina, technique, gender, distance, strategy)
     return (lo + hi) / 2, final_t
+
+
+def find_stat_for_time(
+    target_seconds: float,
+    speed: float,
+    stamina: float | None,
+    technique: float | None,
+    gender: str,
+    distance: float,
+    strategy: str,
+) -> tuple[float, float]:
+    """Binary search stamina (if stamina is None) or technique (if technique is None)
+    to hit target_seconds. Exactly one of stamina/technique must be None."""
+    search_stamina = stamina is None
+    lo, hi = 0.0, 1.0
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        sta = mid if search_stamina else stamina
+        tec = mid if not search_stamina else technique
+        t = simulate_time(speed, sta, tec, gender, distance, strategy)
+        if t > target_seconds:
+            lo = mid
+        else:
+            hi = mid
+    mid = (lo + hi) / 2
+    sta = mid if search_stamina else stamina
+    tec = mid if not search_stamina else technique
+    final_t = simulate_time(speed, sta, tec, gender, distance, strategy)
+    return mid, final_t
+
+
+def find_speed_stamina_for_times(
+    target1_seconds: float,
+    distance1: float,
+    strategy1: str,
+    target2_seconds: float,
+    distance2: float,
+    strategy2: str,
+    technique: float,
+    gender: str,
+) -> tuple[float, float, float, float] | None:
+    """
+    Returns (speed, stamina, sim_time1, sim_time2) or None if no solution found.
+    Uses nested binary search:
+    - Outer loop: binary search stamina (0.0-1.0)
+    - Inner loop: binary search speed (0.0-1.0) to hit target1
+    - Check if that (speed, stamina) also hits target2 within tolerance
+    - Adjust stamina based on whether target2 is too fast or too slow
+    """
+    TOLERANCE = 2.0  # seconds — 2D solving is less precise
+
+    sta_lo, sta_hi = 0.0, 1.0
+    best = None
+    best_err = float('inf')
+
+    for _ in range(40):  # outer: stamina
+        sta_mid = (sta_lo + sta_hi) / 2
+
+        # Inner: find speed that hits target1 with this stamina
+        spd_lo, spd_hi = 0.0, 1.0
+        for _ in range(30):  # inner: speed
+            spd_mid = (spd_lo + spd_hi) / 2
+            t1 = simulate_time(spd_mid, sta_mid, technique, gender, distance1, strategy1)
+            if t1 > target1_seconds:
+                spd_lo = spd_mid
+            else:
+                spd_hi = spd_mid
+
+        speed = (spd_lo + spd_hi) / 2
+        t1 = simulate_time(speed, sta_mid, technique, gender, distance1, strategy1)
+        t2 = simulate_time(speed, sta_mid, technique, gender, distance2, strategy2)
+
+        err = abs(t2 - target2_seconds)
+        if err < best_err:
+            best_err = err
+            best = (speed, sta_mid, t1, t2)
+
+        if err < TOLERANCE:
+            break
+
+        # Adjust stamina: if t2 too slow (athlete fading), increase stamina
+        if t2 > target2_seconds:
+            sta_lo = sta_mid
+        else:
+            sta_hi = sta_mid
+
+    if best and best_err < TOLERANCE * 2:
+        return best
+    return None
 
 
 def _load_json() -> list[dict]:
@@ -306,8 +415,8 @@ class AthleteCreatorApp(tk.Tk):
         frame = tk.LabelFrame(self, text="Target Time", **pad)
         frame.grid(row=1, column=0, columnspan=2, sticky="ew", **pad)
 
-        # Row 0: event, strategy, time entry, button
-        tk.Label(frame, text="Event:").grid(row=0, column=0, sticky="w", padx=(8, 2), pady=6)
+        # Row 0: event 1, strategy 1, time 1
+        tk.Label(frame, text="Event 1:").grid(row=0, column=0, sticky="w", padx=(8, 2), pady=6)
         self._tt_event_var = tk.StringVar(value="800m")
         ttk.Combobox(
             frame, textvariable=self._tt_event_var,
@@ -315,7 +424,7 @@ class AthleteCreatorApp(tk.Tk):
             state="readonly", width=7
         ).grid(row=0, column=1, padx=(2, 12), pady=6)
 
-        tk.Label(frame, text="Strategy:").grid(row=0, column=2, sticky="w", padx=(0, 2), pady=6)
+        tk.Label(frame, text="Strategy 1:").grid(row=0, column=2, sticky="w", padx=(0, 2), pady=6)
         self._tt_strategy_var = tk.StringVar(value="Even Pace")
         ttk.Combobox(
             frame, textvariable=self._tt_strategy_var,
@@ -323,20 +432,77 @@ class AthleteCreatorApp(tk.Tk):
             state="readonly", width=13
         ).grid(row=0, column=3, padx=(2, 12), pady=6)
 
-        tk.Label(frame, text="Target Time:").grid(row=0, column=4, sticky="w", padx=(0, 2), pady=6)
+        tk.Label(frame, text="Target Time 1:").grid(row=0, column=4, sticky="w", padx=(0, 2), pady=6)
         self._tt_entry_var = tk.StringVar()
         tk.Entry(frame, textvariable=self._tt_entry_var, width=10).grid(
             row=0, column=5, padx=(2, 8), pady=6
         )
 
+        # Row 1: event 2, strategy 2, time 2 (optional — enables 2D solver)
+        tk.Label(frame, text="Event 2:").grid(row=1, column=0, sticky="w", padx=(8, 2), pady=6)
+        self._tt_event_var2 = tk.StringVar(value="1600m")
+        ttk.Combobox(
+            frame, textvariable=self._tt_event_var2,
+            values=["400m", "800m", "1600m", "3200m"],
+            state="readonly", width=7
+        ).grid(row=1, column=1, padx=(2, 12), pady=6)
+
+        tk.Label(frame, text="Strategy 2:").grid(row=1, column=2, sticky="w", padx=(0, 2), pady=6)
+        self._tt_strategy_var2 = tk.StringVar(value="Conservative")
+        ttk.Combobox(
+            frame, textvariable=self._tt_strategy_var2,
+            values=["Aggressive", "Even Pace", "Conservative", "Sit & Kick"],
+            state="readonly", width=13
+        ).grid(row=1, column=3, padx=(2, 12), pady=6)
+
+        tk.Label(frame, text="Target Time 2:").grid(row=1, column=4, sticky="w", padx=(0, 2), pady=6)
+        self._tt_entry_var2 = tk.StringVar()
+        tk.Entry(frame, textvariable=self._tt_entry_var2, width=10).grid(
+            row=1, column=5, padx=(2, 8), pady=6
+        )
+        tk.Label(
+            frame, text="(optional — enables 2D solver)",
+            font=("Helvetica", 9, "italic"), fg="#555555"
+        ).grid(row=1, column=6, sticky="w", padx=(0, 8), pady=6)
+
+        # Row 2: Find Speed button + result label
         tk.Button(
             frame, text="Find Speed", command=self._on_find_speed,
             bg="#1565c0", fg="black", font=("Helvetica", 10, "bold"), width=12
-        ).grid(row=0, column=6, padx=(0, 8), pady=6)
+        ).grid(row=2, column=0, columnspan=2, padx=(8, 8), pady=6, sticky="w")
 
-        # Row 1: result label
         self._tt_result_lbl = tk.Label(frame, text="", anchor="w")
-        self._tt_result_lbl.grid(row=1, column=0, columnspan=7, sticky="ew", padx=8, pady=(0, 6))
+        self._tt_result_lbl.grid(row=2, column=2, columnspan=5, sticky="ew", padx=(0, 8), pady=6)
+
+        # Row 3: results Treeview (6 columns; 2D mode enables est_time2 via displaycolumns)
+        cols = ("build", "speed", "stamina", "technique", "est_time", "est_time2")
+        tree = ttk.Treeview(frame, columns=cols, show="headings", height=6,
+                            selectmode="browse")
+        tree.heading("build",     text="Build")
+        tree.heading("speed",     text="Speed")
+        tree.heading("stamina",   text="Stamina")
+        tree.heading("technique", text="Technique")
+        tree.heading("est_time",  text="Est. Time")
+        tree.heading("est_time2", text="Est. Time 2")
+        tree.column("build",     width=120, anchor="w")
+        tree.column("speed",     width=65,  anchor="center")
+        tree.column("stamina",   width=65,  anchor="center")
+        tree.column("technique", width=75,  anchor="center")
+        tree.column("est_time",  width=80,  anchor="center")
+        tree.column("est_time2", width=80,  anchor="center")
+        tree.tag_configure("unavailable", foreground="gray")
+        tree.tag_configure("easiest",  background="#add8e6")
+        tree.tag_configure("balanced", background="#add8e6")
+        tree["displaycolumns"] = ("build", "speed", "stamina", "technique", "est_time")
+        tree.bind("<<TreeviewSelect>>", self._on_profile_select)
+        tree.grid(row=3, column=0, columnspan=7, sticky="ew", padx=8, pady=(2, 4))
+        self._tt_tree = tree
+        self._tt_2d_mode = False
+
+        # Clear table when any input changes
+        for var in (self._tt_event_var, self._tt_strategy_var, self._tt_entry_var,
+                    self._tt_event_var2, self._tt_strategy_var2, self._tt_entry_var2):
+            var.trace_add("write", lambda *_: self._clear_profile_table())
 
     def _on_find_speed(self):
         target_str = self._tt_entry_var.get()
@@ -351,43 +517,162 @@ class AthleteCreatorApp(tk.Tk):
         strategy_key = STRATEGY_MAP[self._tt_strategy_var.get()]
 
         try:
-            sta = self.stamina_var.get()
-            tec = self.technique_var.get()
             gen = self.gender_var.get()
         except tk.TclError:
             return
 
-        fastest = simulate_time(1.0, sta, tec, gen, distance, strategy_key)
-        slowest = simulate_time(0.0, sta, tec, gen, distance, strategy_key)
+        self._clear_profile_table()
 
-        if target_seconds < fastest - 0.5 or target_seconds > slowest + 0.5:
-            msg = (
-                f"Not achievable. "
-                f"Fastest possible: {format_time(fastest)} / Slowest: {format_time(slowest)}"
+        target_str2 = self._tt_entry_var2.get().strip()
+        if target_str2:
+            self._on_find_speed_2d(target_seconds, distance, strategy_key, gen, target_str2)
+        else:
+            self._on_find_speed_1d(target_seconds, distance, strategy_key, gen)
+
+    def _on_find_speed_1d(self, target_seconds, distance, strategy_key, gen):
+        self._tt_2d_mode = False
+        self._tt_tree["displaycolumns"] = ("build", "speed", "stamina", "technique", "est_time")
+        self._tt_tree.heading("est_time", text="Est. Time")
+
+        # Compute speed for each build profile
+        rows: list[tuple[str, float | None, float, float, float | None]] = []
+        for name, sta_preset, tec_preset in PROFILES:
+            sta = self.stamina_var.get() if sta_preset is None else sta_preset
+            tec = self.technique_var.get() if tec_preset is None else tec_preset
+            speed, sim_time = find_speed_for_time(
+                target_seconds, sta, tec, gen, distance, strategy_key
             )
-            self._tt_result_lbl.config(text=msg, fg="red")
+            if abs(sim_time - target_seconds) > 0.5:
+                rows.append((name, None, sta, tec, None))
+            else:
+                rows.append((name, speed, sta, tec, sim_time))
+
+        # Identify easiest (lowest required speed) among valid profiles
+        valid = [(i, r[1]) for i, r in enumerate(rows) if r[1] is not None]
+        easiest_idx = min(valid, key=lambda x: x[1])[0] if valid else None
+
+        for i, (name, speed, sta, tec, sim_time) in enumerate(rows):
+            iid = str(i)
+            if speed is None:
+                values = (name, "N/A", f"{sta:.2f}", f"{tec:.2f}", "N/A", "")
+                self._tt_tree.insert("", "end", iid=iid, values=values,
+                                     tags=("unavailable",))
+            else:
+                values = (name, f"{speed:.3f}", f"{sta:.2f}", f"{tec:.2f}",
+                          format_time(sim_time), "")
+                tags = ("easiest",) if i == easiest_idx else ()
+                self._tt_tree.insert("", "end", iid=iid, values=values, tags=tags)
+
+        if valid:
+            self._tt_result_lbl.config(text="Select a build to apply it.", fg="black")
+        else:
+            self._tt_result_lbl.config(
+                text="Target time is not achievable for any build profile.", fg="red"
+            )
+
+    def _on_find_speed_2d(self, target_seconds1, distance1, strategy_key1, gen, target_str2):
+        target_seconds2 = parse_time(target_str2)
+        if target_seconds2 is None:
             messagebox.showwarning(
-                "Not Achievable",
-                f"Target time is outside the achievable range for this athlete's "
-                f"current stamina, technique, and gender.\n\n"
-                f"Fastest possible: {format_time(fastest)}\n"
-                f"Slowest: {format_time(slowest)}"
+                "Target Time", "Enter a valid time for Event 2 (e.g. 4:30, 270)."
             )
             return
 
-        speed, sim_time = find_speed_for_time(target_seconds, sta, tec, gen, distance, strategy_key)
+        distance2 = EVENT_MAP[self._tt_event_var2.get()]
+        strategy_key2 = STRATEGY_MAP[self._tt_strategy_var2.get()]
+        event1_label = self._tt_event_var.get()
+        event2_label = self._tt_event_var2.get()
 
-        if abs(sim_time - target_seconds) > 0.5:
-            msg = (
-                f"Not achievable. "
-                f"Fastest possible: {format_time(fastest)} / Slowest: {format_time(slowest)}"
+        self._tt_2d_mode = True
+        self._tt_tree["displaycolumns"] = (
+            "build", "speed", "stamina", "technique", "est_time", "est_time2"
+        )
+        self._tt_tree.heading("est_time",  text=f"Est. {event1_label}")
+        self._tt_tree.heading("est_time2", text=f"Est. {event2_label}")
+
+        rows = []
+        for name, tec_preset in PROFILES_2D:
+            tec = self.technique_var.get() if tec_preset is None else tec_preset
+            result = find_speed_stamina_for_times(
+                target_seconds1, distance1, strategy_key1,
+                target_seconds2, distance2, strategy_key2,
+                tec, gen,
             )
-            self._tt_result_lbl.config(text=msg, fg="red")
-            return
+            if result is None:
+                rows.append((name, None, None, tec, None, None))
+            else:
+                speed, stamina, sim_t1, sim_t2 = result
+                rows.append((name, speed, stamina, tec, sim_t1, sim_t2))
 
+        # Find the row closest to balanced stats (|speed - stamina| minimised, only if < 0.15)
+        valid = [(i, r) for i, r in enumerate(rows) if r[1] is not None]
+        balanced_idx = None
+        if valid:
+            min_diff = float('inf')
+            for i, r in valid:
+                diff = abs(r[1] - r[2])
+                if diff < min_diff:
+                    min_diff = diff
+                    balanced_idx = i
+            if min_diff >= 0.15:
+                balanced_idx = None
+
+        for i, (name, speed, stamina, tec, sim_t1, sim_t2) in enumerate(rows):
+            iid = str(i)
+            if speed is None:
+                values = (name, "N/A", "N/A", f"{tec:.2f}", "N/A", "N/A")
+                self._tt_tree.insert("", "end", iid=iid, values=values,
+                                     tags=("unavailable",))
+            else:
+                values = (name, f"{speed:.3f}", f"{stamina:.3f}", f"{tec:.2f}",
+                          format_time(sim_t1), format_time(sim_t2))
+                tags = ("balanced",) if i == balanced_idx else ()
+                self._tt_tree.insert("", "end", iid=iid, values=values, tags=tags)
+
+        if valid:
+            best_idx = balanced_idx if balanced_idx is not None else valid[0][0]
+            r = rows[best_idx]
+            self._tt_result_lbl.config(
+                text=(f"Solved: Speed={r[1]:.2f} Stamina={r[2]:.2f} — "
+                      f"{event1_label}: {format_time(r[4])} / "
+                      f"{event2_label}: {format_time(r[5])}"),
+                fg="#2e7d32",
+            )
+        else:
+            self._tt_result_lbl.config(
+                text="No solution found. Try adjusting your target times.", fg="red"
+            )
+
+    def _on_profile_select(self, event):
+        sel = self._tt_tree.selection()
+        if not sel:
+            return
+        item = sel[0]
+        tags = self._tt_tree.item(item, "tags")
+        if "unavailable" in tags:
+            return
+        values = self._tt_tree.item(item, "values")
+        try:
+            speed     = float(values[1])
+            stamina   = float(values[2])
+            technique = float(values[3])
+        except (ValueError, IndexError):
+            return
         self.speed_var.set(round(speed, 3))
-        msg = f"Speed set to {speed:.3f} — simulated time: {format_time(sim_time)}"
-        self._tt_result_lbl.config(text=msg, fg="#2e7d32")
+        self.stamina_var.set(round(stamina, 3))
+        self.technique_var.set(round(technique, 3))
+        self._tt_result_lbl.config(
+            text=(f"Applied '{values[0]}' — speed {speed:.3f}, "
+                  f"stamina {stamina:.2f}, technique {technique:.2f}"),
+            fg="#2e7d32",
+        )
+
+    def _clear_profile_table(self):
+        if hasattr(self, "_tt_tree"):
+            for item in self._tt_tree.get_children():
+                self._tt_tree.delete(item)
+        if hasattr(self, "_tt_result_lbl"):
+            self._tt_result_lbl.config(text="", fg="black")
 
     def _update_estimated_times(self):
         try:
